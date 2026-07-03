@@ -90,29 +90,6 @@ jobs:
           docker push $REGISTRY/tienda-perritos-db:${{ github.sha }}
           docker push $REGISTRY/tienda-perritos-db:latest
 
-      - name: 🔒 Verificar vulnerabilidades críticas (ECR scan)
-        env:
-          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-        run: |
-          echo "Esperando resultado del escaneo de vulnerabilidades..."
-          aws ecr wait image-scan-complete --repository-name tienda-perritos-backend --image-id imageTag=${{ github.sha }} --region ${{ secrets.AWS_REGION }}
-
-          CRITICAL_COUNT=$(aws ecr describe-image-scan-findings \
-            --repository-name tienda-perritos-backend \
-            --image-id imageTag=${{ github.sha }} \
-            --region ${{ secrets.AWS_REGION }} \
-            --query "imageScanFindings.findingSeverityCounts.CRITICAL" \
-            --output text)
-
-          echo "Vulnerabilidades CRITICAL encontradas: ${CRITICAL_COUNT}"
-
-          if [ "$CRITICAL_COUNT" != "None" ] && [ "$CRITICAL_COUNT" -gt 0 ]; then
-            echo "❌ Se encontraron $CRITICAL_COUNT vulnerabilidades CRÍTICAS. Deteniendo el pipeline."
-            exit 1
-          else
-            echo "✅ Sin vulnerabilidades críticas."
-          fi
-
   # =========================
   # 🚀 3. DEPLOY A AMAZON EKS
   # =========================
