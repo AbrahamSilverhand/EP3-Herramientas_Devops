@@ -1,4 +1,4 @@
-FROM node:18-alpine
+FROM node:26-alpine
  
 # Actualizar paquetes del sistema operativo (Alpine) para parchear
 # vulnerabilidades conocidas (ej. OpenSSL) que puedan venir en la imagen base.
