@@ -22,3 +22,6 @@ Thumbs.db
 
 # Docker
 *.tar.gz
+
+# Kubernetes
+k8s/mysql-secret.yaml
