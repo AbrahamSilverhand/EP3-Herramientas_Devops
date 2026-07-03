@@ -1,0 +1,239 @@
+name: 🐶 CI/CD - Tienda Perritos
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+
+  # =========================
+  # 🧪 1. TESTS
+  # =========================
+  test:
+    name: Pruebas Unitarias
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Instalar dependencias
+        run: |
+          cd backend
+          npm install
+
+      - name: Ejecutar tests con cobertura
+        run: |
+          cd backend
+          npm test
+
+      - name: Subir reporte de cobertura
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: backend/coverage/
+
+  # =========================
+  # 📊 2. SONARCLOUD
+  # =========================
+  sonar:
+    name: SonarCloud Analysis
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Instalar dependencias y generar cobertura
+        run: |
+          cd backend
+          npm install
+          npm test
+
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarqube-scan-action@v6
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+      - name: Verificar Quality Gate (API REST manual con reintentos)
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          STATUS="NONE"
+          ATTEMPTS=0
+          MAX_ATTEMPTS=12
+
+          while [ "$STATUS" = "NONE" ] && [ $ATTEMPTS -lt $MAX_ATTEMPTS ]; do
+            ATTEMPTS=$((ATTEMPTS+1))
+            echo "Intento $ATTEMPTS/$MAX_ATTEMPTS - consultando estado del Quality Gate..."
+            sleep 10
+
+            RESPONSE=$(curl -s -H "Authorization: Bearer ${SONAR_TOKEN}" \
+              "https://sonarcloud.io/api/qualitygates/project_status?projectKey=joralbornoz_ep3-devops-tienda-perritos")
+
+            STATUS=$(echo "$RESPONSE" | grep -o '"status":"[A-Z]*"' | head -1 | cut -d'"' -f4)
+            echo "  -> status actual: $STATUS"
+          done
+
+          echo "Respuesta final: $RESPONSE"
+          echo "Quality Gate status: $STATUS"
+
+          if [ "$STATUS" != "OK" ]; then
+            echo "❌ Quality Gate FALLÓ (o no se pudo calcular a tiempo). Deteniendo el pipeline."
+            exit 1
+          else
+            echo "✅ Quality Gate OK. Continuando el pipeline."
+          fi
+
+  # =========================
+  # 🐳 3. BUILD + PUSH A ECR
+  # =========================
+  build:
+    name: Build & Push a ECR
+    runs-on: ubuntu-latest
+    needs: sonar
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configurar credenciales AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: us-east-1
+
+      - name: Login en Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build & push imagen backend
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          docker build -t $REGISTRY/tienda-perritos-backend:${{ github.sha }} -t $REGISTRY/tienda-perritos-backend:latest ./backend
+          docker push $REGISTRY/tienda-perritos-backend:${{ github.sha }}
+          docker push $REGISTRY/tienda-perritos-backend:latest
+
+      - name: Build & push imagen frontend
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          docker build -t $REGISTRY/tienda-perritos-frontend:${{ github.sha }} -t $REGISTRY/tienda-perritos-frontend:latest ./frontend
+          docker push $REGISTRY/tienda-perritos-frontend:${{ github.sha }}
+          docker push $REGISTRY/tienda-perritos-frontend:latest
+
+      - name: Build & push imagen db
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          docker build -t $REGISTRY/tienda-perritos-db:${{ github.sha }} -t $REGISTRY/tienda-perritos-db:latest ./db
+          docker push $REGISTRY/tienda-perritos-db:${{ github.sha }}
+          docker push $REGISTRY/tienda-perritos-db:latest
+
+      - name: 🔒 Verificar vulnerabilidades críticas (ECR scan)
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          echo "Esperando resultado del escaneo de vulnerabilidades..."
+          aws ecr wait image-scan-complete --repository-name tienda-perritos-backend --image-id imageTag=${{ github.sha }} --region us-east-1
+
+          CRITICAL_COUNT=$(aws ecr describe-image-scan-findings \
+            --repository-name tienda-perritos-backend \
+            --image-id imageTag=${{ github.sha }} \
+            --region us-east-1 \
+            --query "imageScanFindings.findingSeverityCounts.CRITICAL" \
+            --output text)
+
+          echo "Vulnerabilidades CRITICAL encontradas: ${CRITICAL_COUNT}"
+
+          if [ "$CRITICAL_COUNT" != "None" ] && [ "$CRITICAL_COUNT" -gt 0 ]; then
+            echo "❌ Se encontraron $CRITICAL_COUNT vulnerabilidades CRÍTICAS. Deteniendo el pipeline."
+            exit 1
+          else
+            echo "✅ Sin vulnerabilidades críticas."
+          fi
+
+  # =========================
+  # 🚀 4. DEPLOY A AWS ECS
+  # =========================
+  deploy:
+    name: Deploy a ECS
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configurar credenciales AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: us-east-1
+
+      - name: Actualizar imágenes en la Task Definition
+        run: |
+          REGISTRY="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com"
+          sed -i "s|${REGISTRY}/tienda-perritos-frontend:latest|${REGISTRY}/tienda-perritos-frontend:${{ github.sha }}|g" task-definition.json
+          sed -i "s|${REGISTRY}/tienda-perritos-backend:latest|${REGISTRY}/tienda-perritos-backend:${{ github.sha }}|g" task-definition.json
+          sed -i "s|${REGISTRY}/tienda-perritos-db:latest|${REGISTRY}/tienda-perritos-db:${{ github.sha }}|g" task-definition.json
+          cat task-definition.json
+
+      - name: Registrar nueva revisión de la Task Definition
+        id: register-task-def
+        run: |
+          TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://task-definition.json \
+            --region us-east-1 \
+            --query "taskDefinition.taskDefinitionArn" \
+            --output text)
+          echo "task_def_arn=$TASK_DEF_ARN" >> "$GITHUB_OUTPUT"
+          echo "Nueva revisión registrada: $TASK_DEF_ARN"
+
+      - name: Actualizar el servicio ECS
+        run: |
+          aws ecs update-service \
+            --cluster tienda-perritos-cluster \
+            --service tienda-perritos-service \
+            --task-definition ${{ steps.register-task-def.outputs.task_def_arn }} \
+            --force-new-deployment \
+            --region us-east-1
+
+      - name: Esperar a que el servicio esté estable
+        run: |
+          aws ecs wait services-stable \
+            --cluster tienda-perritos-cluster \
+            --services tienda-perritos-service \
+            --region us-east-1
+
+      - name: Confirmar despliegue exitoso
+        run: |
+          aws ecs describe-services \
+            --cluster tienda-perritos-cluster \
+            --services tienda-perritos-service \
+            --region us-east-1 \
+            --query "services[0].{status:status,running:runningCount,desired:desiredCount,taskDef:taskDefinition}"
+          echo "✅ Despliegue a ECS completado correctamente."

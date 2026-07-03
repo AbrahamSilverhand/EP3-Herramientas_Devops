@@ -1,0 +1,26 @@
+{
+  "name": "tienda-perritos-backend",
+  "version": "1.0.0",
+  "description": "API backend para tienda de alimentos para perritos",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "jest --coverage --forceExit --detectOpenHandles"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.0",
+    "mysql2": "^3.9.0"
+  },
+  "devDependencies": {
+    "jest": "^29.0.0",
+    "supertest": "^7.0.0"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "testMatch": [
+      "**/test/**/*.test.js",
+      "**/tests/**/*.test.js"
+    ]
+  }
+}

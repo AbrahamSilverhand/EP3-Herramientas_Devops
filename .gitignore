@@ -1,0 +1,24 @@
+# Node.js
+node_modules/
+npm-debug.log*
+
+# Coverage
+backend/coverage/
+
+# Variables de entorno
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# VS Code
+.vscode/
+
+# Docker
+*.tar.gz
