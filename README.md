@@ -1,31 +1,49 @@
-# 🐶 Tienda de Alimentos para Perritos — EP3 DevOps
+# 🐶 Tienda de Alimentos para Perritos — DevOps con Amazon EKS
 
-Aplicación web de 3 capas desplegada en **AWS ECS (Fargate)**, con pipeline CI/CD completo en GitHub Actions: pruebas automatizadas, análisis de calidad (SonarCloud), escaneo de vulnerabilidades (Amazon ECR), y despliegue automatizado con políticas de cumplimiento (Branch Protection).
+Aplicación web de 3 capas (Frontend · Backend · MySQL) desplegada en **Amazon EKS (Kubernetes)**, con pipeline CI/CD completo en GitHub Actions: pruebas automatizadas, build y publicación de imágenes en Amazon ECR, y despliegue automático mediante `kubectl`.
 
-![Pipeline](https://github.com/AbrahamSilverhand/EP3-DevOps/actions/workflows/ci-cd.yml/badge.svg)
+![Pipeline](https://github.com/AbrahamSilverhand/EP3-Herramientas_Devops/actions/workflows/ci-cd.yml/badge.svg)
+
+> 📌 Este proyecto migró desde una arquitectura original en **Amazon ECS/Fargate** hacia **Amazon EKS**, para aplicar prácticas de orquestación de contenedores con Kubernetes: auto-escalamiento (HPA), auto-recuperación (ReplicaSet + Probes) y despliegue continuo declarativo (manifiestos YAML).
 
 ---
 
 ## 🏗️ Arquitectura
 
 ```text
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│   Frontend  │────▶│   Backend   │────▶│   MySQL DB  │
-│ HTML + Nginx│     │ Node.js 18  │     │   MySQL 8   │
-│  Port 80    │     │ + Express   │     │ Port 3306   │
-│             │     │  Port 3001  │     │             │
-└─────────────┘     └─────────────┘     └─────────────┘
-      └───────────── 1 Task Definition de AWS ECS (Fargate) ─────┘
-                         networkMode: awsvpc
+                              INTERNET
+                                  │
+                                  ▼
+                          Internet Gateway
+                                  │
+        ┌─────────────────────────────────────────────┐
+        │           VPC 10.0.0.0/16                     │
+        │  ┌───────────────────────────────────────┐   │
+        │  │  Subredes Públicas (2 AZ)               │   │
+        │  │  NAT Gateway · Load Balancer             │   │
+        │  └───────────────────────────────────────┘   │
+        │  ┌───────────────────────────────────────┐   │
+        │  │  Subredes Privadas (2 AZ)                │   │
+        │  │  ┌─────────────────────────────────┐  │   │
+        │  │  │  Amazon EKS — Namespace: tienda    │  │   │
+        │  │  │                                    │  │   │
+        │  │  │  Frontend ──/api/──▶ Backend ──▶ MySQL │  │   │
+        │  │  │  (Nginx)   proxy    (Node.js)    (MySQL 8)│  │   │
+        │  │  │  LoadBalancer   ClusterIP      ClusterIP  │  │   │
+        │  │  └─────────────────────────────────┘  │   │
+        │  └───────────────────────────────────────┘   │
+        └─────────────────────────────────────────────┘
+                                  │
+                    Amazon ECR · Amazon CloudWatch
 ```
 
-Los 3 contenedores corren juntos en una única **Task Definition** de Amazon ECS (Fargate), comunicándose vía `localhost` gracias al modo de red `awsvpc`. Cada contenedor tiene su propia imagen en **Amazon ECR**, con escaneo automático de vulnerabilidades activado.
+Los 3 componentes corren como **Pods independientes** en el clúster EKS. El Frontend (Nginx) es el único expuesto públicamente vía un Service `LoadBalancer`; hace de proxy inverso hacia el Backend (`/api/` → `backend:3001`), que a su vez se conecta a MySQL (`mysql:3306`) — ambos como Services `ClusterIP`, inaccesibles desde fuera del clúster. La resolución de nombres es vía DNS interno de Kubernetes (CoreDNS).
 
 ---
 
 ## 🚀 Pipeline CI/CD
 
-Cada `push` a `main` (vía Pull Request aprobado — ver Branch Protection) ejecuta automáticamente:
+Cada `push` a `main` ejecuta automáticamente:
 
 ```text
 push a main
@@ -38,45 +56,68 @@ push a main
          │ needs: test
          ▼
 ┌─────────────────┐
-│ 🔍 SonarCloud    │  Análisis de calidad → Quality Gate
-│ Analysis         │  verificado vía API REST con reintentos
-└────────┬─────────┘  ❌ Si falla → PIPELINE SE DETIENE
-         │ needs: sonar
-         ▼
-┌─────────────────┐
-│ 🐳 Build & Push  │  Build 3 imágenes → push a Amazon ECR
-│ a ECR            │  → espera resultado del escaneo de vulnerabilidades
-└────────┬─────────┘  ❌ Si hay CVE CRITICAL → PIPELINE SE DETIENE
+│ 🐳 Build & Push  │  Build 3 imágenes (frontend/backend/db)
+│ a Amazon ECR     │  → tag = SHA del commit → push a ECR
+└────────┬─────────┘
          │ needs: build, solo en main
          ▼
 ┌─────────────────┐
-│ 🚀 Deploy a ECS  │  Actualiza Task Definition → ECS Service
-│                  │  → espera estabilidad (services-stable)
-└──────────────────┘  ❌ Si no estabiliza → PIPELINE SE DETIENE
+│ 🚀 Deploy a EKS  │  kubectl apply (manifiestos k8s/)
+│                  │  → kubectl set image (nuevo SHA)
+│                  │  → kubectl rollout status (confirma éxito)
+└──────────────────┘  ❌ Si el rollout no se estabiliza → PIPELINE SE DETIENE
 ```
 
-**Tiempo de ejecución completo:** ~5-7 minutos.
+**Autenticación:** las credenciales de AWS (temporales, de AWS Academy) y los parámetros del clúster se gestionan como **GitHub Secrets** encriptados — nunca expuestos en el código.
 
 ---
 
-## 🛡️ Políticas de cumplimiento
+## ☸️ Recursos de Kubernetes (`k8s/`)
 
-| Mecanismo | Qué hace |
-|---|---|
-| **SonarCloud Quality Gate** | Bloquea el pipeline si el código nuevo no cumple cobertura, o tiene bugs/vulnerabilidades |
-| **Escaneo de ECR** | Bloquea el pipeline si se detecta al menos 1 vulnerabilidad `CRITICAL` en las imágenes Docker |
-| **Branch Protection (`main`)** | Exige Pull Request + 1 aprobación + los 3 checks del pipeline en verde antes de permitir merge |
+| Archivo | Recurso | Función |
+|---|---|---|
+| `namespace.yaml` | Namespace `tienda` | Aísla todos los recursos del proyecto |
+| `mysql-secret.yaml.example` | Secret (plantilla) | Estructura de credenciales de BD — el archivo real (`mysql-secret.yaml`) está excluido del repo vía `.gitignore` |
+| `mysql-deployment.yaml` / `mysql-service.yaml` | Deployment + Service ClusterIP | Base de datos MySQL 8 |
+| `backend-deployment.yaml` / `backend-service.yaml` | Deployment + Service ClusterIP | API REST (Node.js/Express) |
+| `frontend-deployment.yaml` / `frontend-service.yaml` | Deployment + Service LoadBalancer | Interfaz web (Nginx + proxy) |
+| `backend-hpa.yaml` / `frontend-hpa.yaml` | HorizontalPodAutoscaler | Autoescalado (min:1, max:3, CPU objetivo 70%) |
 
-📌 **Caso real documentado:** el 2 de julio de 2026, el pipeline detectó 2 vulnerabilidades `CRITICAL` (CVSS 9.8) en `openssl` dentro de la imagen base `node:18-alpine`, y detuvo el despliegue automáticamente. Ver detalle completo en `Documentacion_EP3_DevOps.docx` / `Informe_Evidencias_EP3_v2.docx`.
+Para desplegar manualmente (fuera del pipeline):
+```bash
+kubectl apply -f k8s/namespace.yaml
+kubectl apply -f k8s/mysql-secret.yaml   # usar tu propia copia, no versionada
+kubectl apply -f k8s/
+```
 
 ---
 
-## 📊 Monitoreo y observabilidad (AWS CloudWatch)
+## 🔒 Seguridad y buenas prácticas aplicadas
 
-- **Logs centralizados**: `/ecs/tienda-perritos` (streams separados por contenedor)
-- **Container Insights**: métricas de CPU, memoria y disponibilidad (`RunningTaskCount` vs `DesiredTaskCount`)
-- **Alarmas**: CPU > 70% y disponibilidad caída, notificando vía SNS/correo
-- **Dashboard**: `tienda-perritos-dashboard` — CPU, memoria, disponibilidad y errores en un solo panel
+- **Imágenes base minimalistas**: `nginx:alpine` y `node:18-alpine`, reduciendo la superficie de ataque.
+- **Dependencias de producción only**: el backend usa `npm ci --omit=dev`.
+- **Exposición mínima de puertos**: solo el Frontend es público (Service `LoadBalancer`); Backend y MySQL son `ClusterIP`.
+- **Secretos protegidos**: credenciales de BD en un Kubernetes `Secret` (Base64), excluido del control de versiones; plantilla pública (`.example`) para referencia.
+- **Mínimo privilegio en IAM**: roles separados para el Control Plane (Cluster Role) y los nodos (Node Role) de EKS.
+- **Probes de salud**: Liveness y Readiness configuradas en los 3 componentes (`/api/health` en el backend).
+
+---
+
+## 📊 Observabilidad
+
+- **Logs del pipeline**: disponibles en la pestaña *Actions* de GitHub (build, test, deploy).
+- **Logs del clúster**: Control Plane logging habilitado hacia Amazon CloudWatch (`/aws/eks/tienda-perritos-eks/cluster`).
+- **Métricas**: namespace `AWS/EKS` en CloudWatch (requests al API Server, estado del scheduler).
+- **Alarma**: `tienda-perritos-nodo-cpu-alta` — CPU del nodo > 80% durante 10 minutos.
+
+---
+
+## ⚙️ Escalabilidad y resiliencia
+
+- **Horizontal Pod Autoscaler**: min 1 / max 3 réplicas, umbral de CPU 70%, validado con carga real (escalamiento 1→3 en menos de 1 minuto).
+- **Auto Healing**: los ReplicaSets recrean automáticamente cualquier Pod eliminado o caído.
+- **Node Group en Auto Scaling**: instancias EC2 Spot (t3.large), reemplazadas automáticamente ante interrupciones (comportamiento validado en producción durante el desarrollo).
+- **RollingUpdate sin downtime**: las actualizaciones de imagen no interrumpen el servicio.
 
 ---
 
@@ -84,59 +125,40 @@ push a main
 
 ```text
 .
-├── backend/              # API Node.js + Express + MySQL2
+├── backend/                # API Node.js + Express + MySQL2
 │   ├── Dockerfile
 │   ├── server.js
 │   └── tests/
-├── frontend/             # HTML/JS estático + Nginx
-│   └── Dockerfile
-├── db/                   # Imagen custom de MySQL con datos semilla
+├── frontend/                # HTML/JS estático + Nginx (proxy /api/)
+│   ├── Dockerfile
+│   ├── nginx.conf
+│   └── app.js
+├── db/                      # Imagen custom de MySQL con datos semilla
 │   ├── Dockerfile
 │   └── init.sql
+├── k8s/                      # Manifiestos de Kubernetes (ver tabla arriba)
 ├── .github/workflows/
-│   └── ci-cd.yml         # Pipeline completo
-├── task-definition.json  # Definición de la tarea de ECS
-├── sonar-project.properties
-└── Documentacion_EP3_DevOps.docx   # Documentación técnica completa
+│   └── ci-cd.yml             # Pipeline CI/CD (test → build/push → deploy)
+├── docker-compose.yml         # Entorno de desarrollo local
+└── .gitignore                 # Excluye k8s/mysql-secret.yaml (credenciales reales)
 ```
 
 ---
 
-## 🧰 Stack tecnológico
+## 🖥️ Desarrollo local
 
-| Capa | Tecnología |
-|---|---|
-| Frontend | HTML/JS + Nginx |
-| Backend | Node.js 18, Express, mysql2 |
-| Base de datos | MySQL 8 |
-| Contenerización | Docker |
-| Orquestación | AWS ECS (Fargate) |
-| Registro de imágenes | Amazon ECR (con escaneo de vulnerabilidades) |
-| CI/CD | GitHub Actions |
-| Calidad de código | SonarCloud |
-| Observabilidad | AWS CloudWatch (Logs, Container Insights, Alarms, Dashboards) |
-| Notificaciones | Amazon SNS |
+```bash
+docker-compose up
+```
+
+Levanta los 3 servicios en una red local, accesible en `http://localhost`.
 
 ---
 
-## ⚠️ Limitaciones conocidas (entorno AWS Academy)
+## 🌐 Despliegue en la nube
 
-- Las credenciales de AWS Academy expiran cada 3-4 horas y deben refrescarse manualmente (local + GitHub Secrets) — en producción se resolvería con autenticación OIDC.
-- Se reutiliza el rol `LabRole` (no se pueden crear roles IAM nuevos en Academy).
-- La base de datos corre dentro de la misma Task Definition en vez de Amazon RDS, por restricciones de tiempo/cupos de la cuenta educativa.
+La aplicación corre en un clúster Amazon EKS (`tienda-perritos-eks`, región `us-east-1`), accesible públicamente a través del Service `LoadBalancer` del Frontend. La URL pública se obtiene con:
 
-Ver el documento `Documentacion_EP3_DevOps.docx` para el detalle completo de decisiones arquitectónicas, incidentes resueltos, y evidencia de cada requisito de la evaluación.
-
----
-
-## 🤖 Uso de Inteligencia Artificial
-
-Durante el desarrollo de este proyecto se utilizó **Claude (Anthropic)** como herramienta de apoyo para:
-- Generación de estructura base del pipeline CI/CD
-- Configuración de SonarCloud con GitHub Actions
-- Generación de tests unitarios con Jest
-
-Todos los contenidos fueron revisados, validados y adaptados por el equipo según los requerimientos del proyecto.
-
-Referencia: https://bibliotecas.duoc.cl/ia
-
+```bash
+kubectl get svc frontend -n tienda
+```
