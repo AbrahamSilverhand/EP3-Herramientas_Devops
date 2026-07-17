@@ -10,7 +10,7 @@
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.19.0",
-    "mysql2": "^3.9.0"
+    "mysql2": "^3.23.0"
   },
   "devDependencies": {
     "jest": "^29.0.0",
